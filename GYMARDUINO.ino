@@ -1,346 +1,197 @@
-#include <StreamUtils.h>
-#include <SPI.h>
-#include <MFRC522.h>
-#include <ArduinoJson.h>
 #include <SoftwareSerial.h>
+#include <ArduinoJson.h>
 #include <Servo.h>
 
-Servo myservo;  // create servo object to control a servo
+const int BUFFER_SIZE = 14; // RFID DATA FRAME FORMAT: 1byte head (value: 2), 10byte data (2byte version + 8byte tag), 2byte checksum, 1byte tail (value: 3)
+const int DATA_SIZE = 10; // 10byte data (2byte version + 8byte tag)
+const int DATA_VERSION_SIZE = 2; // 2byte version (actual meaning of these two bytes may vary)
+const int DATA_TAG_SIZE = 8; // 8byte tag
+const int CHECKSUM_SIZE = 2; // 2byte checksum
 
+SoftwareSerial ssrfid(10,11); 
 SoftwareSerial mySerial(2, 3); // RX, TX
 
-MFRC522 mfrc522(10, 9);   // Create Instance of MFRC522 mfrc522(SS_PIN, RST_PIN)
-
+uint8_t buffer[BUFFER_SIZE]; // used to store an incoming data frame 
+int buffer_index = 0;
 const int buzzerPin = 7; //buzzer attach to digital 7
 const int ledPin = 4; //LED green light
 const int ledPin2 = 5; //LED red light
 
-int isWifiInit = 0;
-bool isRead = false;
-bool isNewCard = false;
-String tagContent = "";
-String currentUID = "";
-
-int servoPin = 6;
+long lasttag;
 
 // Interval before we process the same RFID
-int INTERVAL = 2000;
+int INTERVAL = 10000;
 unsigned long previousMillis = 0;
 unsigned long currentMillis = 0;
+bool isNewCard = false;
 
 const byte numChars = 32;
-char receivedChars[numChars];
+char receivedChars[numChars];;
 
 boolean newData = false;
-boolean wifiAvailable = false;
+Servo myServo;  // create servo object to control a servo
 
-int pos = 0; 
+int lockedPos = 15;
+int unlockPos = 180;
 
-void setup()
-{
-  Serial.begin(115200);
+void setup() {
+  Serial.begin(115200); 
   mySerial.begin(4800);
   mySerial.setTimeout(5000);
-  // Setup the buzzer
+
+  ssrfid.begin(9600);
+  ssrfid.listen(); 
+
   pinMode(buzzerPin, OUTPUT);
-  // Setup the led
-  pinMode(ledPin, OUTPUT);
-  pinMode(ledPin2, OUTPUT);
-  // Setup Servo
-  myservo.attach(6);  // attaches the servo on pin 9 to the servo object
 
-  
-  SPI.begin();
-  mfrc522.PCD_Init();
+  Serial.println("Waiting for RFID...");
+  playAuthorized();
 
-  Serial.println("Detecting RFID Tags");
-  mfrc522.PCD_DumpVersionToSerial();
-  
-  // Serial.println(mySerial.available());
+  myServo.attach(6);  // attaches the servo on pin 6 to the servo object
+  myServo.write(lockedPos);   
 
-  // while (!mySerial.available()) {
-  //   delay(500);
-  //   Serial.print(".");
-  //   if (mySerial.available()){
-  //     turnOnRedLED();
-  //     // String IncomingString=mySerial.readString();
-  //     // Serial.print(IncomingString);
-  //     break;
-  //   }
-  // }
-
-  // int hey = 0;
-  // while (!mySerial.available()) {
-  //   hey++;
-  //   delay(500);
-  //   Serial.print(".");
-  //   // if (hey >= 200)
-  //   //   break;
-  //   if (mySerial.available()){
-  //     break;
-  //   }
-  //   delay(100);
-  // }
-
-  // if (mySerial.available()){
-  // alternateLED();
+  turnOnGreenLED();
 }
 
-void loop()
-{ 
-  recvWithStartEndMarkers();
-  showNewData();
-  readRFID();
-}
-
-void readRFID() {
-
-  String IncomingString="";
-  boolean StringReady = false;
-
-  // Look for new cards
-  if (mfrc522.PICC_IsNewCardPresent())
-  {
-    // Select one of the cards
-    if (mfrc522.PICC_ReadCardSerial())
-    {
-      isRead = true;
-
-      byte letter;
-      for (byte i = 0; i < mfrc522.uid.size; i++)
-      {
-        tagContent.concat(String(mfrc522.uid.uidByte[i] < 0x10 ? " 0" : " "));
-        tagContent.concat(String(mfrc522.uid.uidByte[i], HEX));
-      }
-
-      tagContent.toUpperCase();
+void loop() {
+  if (ssrfid.available() > 0){
+    bool call_extract_tag = false;
+    
+    int ssvalue = ssrfid.read(); // read 
+    if (ssvalue == -1) { // no data was read
+      return;
     }
-    if (isRead) {
-      currentMillis = millis();
-      // If current UID is not equal to current UID..meaning new card, then validate if it has access
-      if (currentUID != tagContent) {
-        currentUID =  tagContent;
+
+    if (ssvalue == 2) { // RDM630/RDM6300 found a tag => tag incoming 
+      buffer_index = 0;
+    } else if (ssvalue == 3) { // tag has been fully transmitted       
+      call_extract_tag = true; // extract tag at the end of the function call
+    }
+
+    if (buffer_index >= BUFFER_SIZE) { // checking for a buffer overflow (It's very unlikely that an buffer overflow comes up!)
+      Serial.print("_");
+      return;
+    }
+    
+    buffer[buffer_index++] = ssvalue; // everything is alright => copy current value to buffer
+
+    if (call_extract_tag == true) {
+      if (buffer_index == BUFFER_SIZE) {
+        extract_tag();
+      } else { // something is wrong... start again looking for preamble (value: 2)
+        buffer_index = 0;
+        return;
+      }
+    }    
+  }    
+}
+
+unsigned extract_tag() {
+    uint8_t msg_head = buffer[0];
+    uint8_t *msg_data = buffer + 1; // 10 byte => data contains 2byte version + 8byte tag
+    // uint8_t *msg_data_version = msg_data;
+    uint8_t *msg_data_tag = msg_data + 2;
+    // uint8_t *msg_checksum = buffer + 11; // 2 byte
+    // uint8_t msg_tail = buffer[13];
+
+    currentMillis = millis();
+    String IncomingString="";
+    long tag = hexstr_to_value(msg_data_tag, DATA_TAG_SIZE);
+    if(tag != lasttag){
+      lasttag = tag;
+      isNewCard = true;
+    }
+    else{
+      if (currentMillis - previousMillis >= INTERVAL) {
         isNewCard = true;
       } else {
-        // If it is the same RFID UID then we wait for interval to pass before we process the same RFID
-        if (currentMillis - previousMillis >= INTERVAL) {
-          isNewCard = true;
-        } else {
-          isNewCard = false;
-        }
+        isNewCard = false;
       }
-      if (isNewCard) {
-        if (tagContent != "") {
-          // turn off LED if it is on for new card
-          // turnOffLED();
-          // loadingLED();
+    }
+
+    if (isNewCard) {
+      previousMillis = currentMillis;
+      playNotAuthorized();
+      mySerial.begin(4800);
+
+      Serial.print("Sending data to ESP-01 :: ");
+      Serial.println(tag);
+      mySerial.println(tag);
+      Serial.println("Waiting for response from ESP-01....");
+
+      int iCtr = 0;
+      while (!mySerial.available()) {
+        iCtr++;
+        if (iCtr >= 40 || mySerial.available())
+          break;
+        delay(50);
+      }
+      
+      mySerial.listen();
+  
+      if (mySerial.available() > 0) {
+
+        IncomingString=mySerial.readString();
+        StaticJsonDocument<200> doc1;
+        deserializeJson(doc1, IncomingString);
+        const char* isSuccess = doc1["is_success"];
+        Serial.println(isSuccess);
+        Serial.println(IncomingString);
+
+        if (strcmp(isSuccess, "USE") == 0) {
+          playAuthorized();
+          turnOnRedLED();
+          turnOffGreenLED();
+          myServo.write(unlockPos);   
+        } else if (strcmp(isSuccess, "NEXT") == 0) { //light up the RED LED
+          playAuthorized();
+          turnOffRedLED();
+          turnOnGreenLED();
+          myServo.write(lockedPos);   
+        } else {     // If not authorized then sound the buzzer
           playNotAuthorized();
-
-          previousMillis = currentMillis;
-          //Send the RFID Uid code to the ESP-01 for validation
-          Serial.print("Sending data to ESP-01 :: ");
-          // Serial.println(tagContent);
-          //TODO Process read from serial here
-          mySerial.println(tagContent);
-          Serial.println("mySerialtagContent =xx" + urlencode(tagContent) + "xx");
-          Serial.println("Waiting for response from ESP-01....");
-
-          int iCtr = 0;
-          while (!mySerial.available()) {
-            // Serial.println(iCtr);
-            iCtr++;
-            if (iCtr >= 200)
-              break;
-            // if (mySerial.available())
-            //   break;
-            delay(50);
-          }
-          if (mySerial.available()) {
-            // bool isAuthorized = isUserAuthorized(tagContent);
-            
-            IncomingString=mySerial.readString();
-            StringReady=true;
-
-            if(StringReady){
-              Serial.println(IncomingString);
-            }
-
-            StaticJsonDocument<200> doc1;
-            deserializeJson(doc1, IncomingString);
-            const char* isSuccess = doc1["is_success"];
-            Serial.println(isSuccess);
-
-            if (isSuccess == "true") { //light up the RED LED
-              turnOnLED();
-              turnOnRedLED();
-              playAuthorized();
-              for (pos = 0; pos <= 180; pos += 2) { // goes from 0 degrees to 180 degrees
-                // in steps of 1 degree
-                Serial.println(pos);
-                myservo.write(pos);              // tell servo to go to position in variable 'pos'
-                delay(15);                       // waits 15 ms for the servo to reach the position
-              }
-            } else {     // If not authorized then sound the buzzer
-              alternateLED();
-              turnOnGreenLED();
-              playNotAuthorized();
-            }
-          }
-          Serial.println("Finished processing response from ESP-01....");
         }
 
-      }
-
-    } else {
-      Serial.println("No card details was read!");
-    }
-    tagContent = "";
-    isNewCard = false;
-  }
-}
-
-void recvWithStartEndMarkers() {
-    static byte ndx = 0;
-    char endMarker = '\n';
-    char rc;
-
-    while (mySerial.available() > 0 && newData == false) {
+        char rc;
         rc = mySerial.read();
-        // turnRedLED();
-        // Serial.print(rc);
-        if (rc != endMarker) {
-            receivedChars[ndx] = rc;
-            ndx++;
-            if (ndx >= numChars) {
-                ndx = numChars - 1;
-            }
-        }
-        else {
-            receivedChars[ndx] = '\0'; // terminate the string
-            ndx = 0;
-            newData = true;
-        }
-    }
-}
+        Serial.println(rc);
+        Serial.println(mySerial.available());
 
-void showNewData() {
-    if (newData == true) {
-        Serial.print("This just in ... ");
-        Serial.println(receivedChars);
-        newData = false;
-    }
-}
-
-bool isUserAuthorized(String tagContent) {
-  const size_t capacity = JSON_OBJECT_SIZE(1) + 30;
-  DynamicJsonDocument doc(capacity);
-
-  // Serial.print("My capacity : ");
-  // Serial.println(capacity);
-
-  // Use during debugging
-  //  ReadLoggingStream loggingStream(mySerial, Serial);
-  //  DeserializationError error = deserializeJson(doc, loggingStream);
-
-  // Use during actual running
-  DeserializationError error = deserializeJson(doc, mySerial);
-  if (error) {
-    //    Serial.print(F("deserializeJson() failed: "));
-    // Serial.println(error.c_str());
-    return error.c_str();
-  }
-
-  bool   is_authorized = doc["is_authorized"] == "true";
-  doc["wow"] = "+93+1C+7F+24%0D";
-    // Serial.println(is_authorized);
-  serializeJson(doc, Serial);
-  return is_authorized;
-}
-
-
-String urlencode(String str)
-{
-    String encodedString="";
-    char c;
-    char code0;
-    char code1;
-    char code2;
-    for (int i =0; i < str.length(); i++){
-      c=str.charAt(i);
-      if (c == ' '){
-        encodedString+= '+';
-      } else if (isalnum(c)){
-        encodedString+=c;
-      } else{
-        code1=(c & 0xf)+'0';
-        if ((c & 0xf) >9){
-            code1=(c & 0xf) - 10 + 'A';
-        }
-        c=(c>>4)&0xf;
-        code0=c+'0';
-        if (c > 9){
-            code0=c - 10 + 'A';
-        }
-        code2='\0';
-        encodedString+='%';
-        encodedString+=code0;
-        encodedString+=code1;
-        // encodedString+=code2;
+        previousMillis = currentMillis + INTERVAL;
+ 
       }
-      yield();
+
+      Serial.println("Finished processing response from ESP-01....");
     }
-    return encodedString;
-    
+
+    ssrfid.listen(); 
+    isNewCard = false;
+    return tag;
 }
 
-void loadingLED() {
-  while (true) {
-    digitalWrite(ledPin, HIGH);
-    digitalWrite(ledPin2, LOW);
-    delay(500);
-    digitalWrite(ledPin, LOW);
-    digitalWrite(ledPin2, HIGH);
-    delay(500);
-  }
-}
-
-void turnOnEntranceLED() {
-  digitalWrite(ledPin, HIGH);
-  delay(200);
-  digitalWrite(ledPin, LOW);
-  delay(500);
-  digitalWrite(ledPin, HIGH);
-  delay(200);
-  digitalWrite(ledPin, LOW);
+long hexstr_to_value(char *str, unsigned int length) { // converts a hexadecimal value (encoded as ASCII string) to a numeric value
+  char* copy = malloc((sizeof(char) * length) + 1); 
+  memcpy(copy, str, sizeof(char) * length);
+  copy[length] = '\0'; 
+  // the variable "copy" is a copy of the parameter "str". "copy" has an additional '\0' element to make sure that "str" is null-terminated.
+  long value = strtol(copy, NULL, 16);  // strtol converts a null-terminated string to a long value
+  free(copy); // clean up 
+  return value;
 }
 
 void playNotAuthorized() {
   tone(buzzerPin, 1500);
-  delay(500);
+  delay(100);
   noTone(7);
 }
 
 void playAuthorized() {
   tone(buzzerPin, 1700);
-  delay(1000);
+  delay(200);
   noTone(7);
   tone(buzzerPin, 1900);
-  delay(1000);
+  delay(500);
   noTone(7);
-}
-
-void alternateLED() {
-  digitalWrite(ledPin, HIGH);
-  digitalWrite(ledPin2, HIGH);
-  delay(1000);
-  digitalWrite(ledPin, LOW);
-  digitalWrite(ledPin2, LOW);
-}
-
-void turnOnLED() {
-  digitalWrite(ledPin, HIGH);
-  delay(1000);
-  digitalWrite(ledPin, LOW);
 }
 
 void turnOnGreenLED() {
@@ -349,14 +200,15 @@ void turnOnGreenLED() {
 
 void turnOffGreenLED() {
   digitalWrite(ledPin, LOW);
+  delay(50);
 }
 
 void turnOnRedLED() {
   digitalWrite(ledPin2, HIGH);
+  delay(50);
 }
 
-void turnRedLED() {
-  digitalWrite(ledPin2, HIGH);
-  delay(1000);
+void turnOffRedLED() {
   digitalWrite(ledPin2, LOW);
+  delay(50);
 }
