@@ -1,6 +1,5 @@
 #include <ESP8266WiFi.h>
 #include <FirebaseESP8266.h>
-
 // NOTE:  CHANGE THIS TO YOUR WIFI SSID AND PASSWORD
 const char* ssid     = "Shoyou Boi";
 const char* password = "@Siomairice26";
@@ -18,13 +17,18 @@ FirebaseData fbdo;
 FirebaseAuth auth;
 FirebaseConfig config;
 
-unsigned long sendDataPrevMillis = 0;
 bool signupOK = false;
 
 String rfidRead = "";
-String pendingRfid = "";
 String status = "";
+String statusRead = "";
 String pR = "";
+
+// Interval before we process the same RFID
+int INTERVAL = 3000;
+unsigned long previousMillis = 0;
+unsigned long currentMillis = 0;
+bool isNewCard = false;
 
 void setup() {
   Serial.begin(4800);
@@ -41,7 +45,6 @@ void setup() {
     Serial.print(".");
   }
 
-  Serial.println("");
   Serial.println("WiFi connected");  
   Serial.println("IP address: ");
   Serial.println(WiFi.localIP());
@@ -71,8 +74,9 @@ char receivedChars[numChars];   // an array to store the received data
 boolean newData = false;
 
 void loop() {
-    recvWithEndMarker();
-    processRFIDCode();
+  recvWithEndMarker();
+  processRFIDCode();
+  checkPending();
 }
 
 void recvWithEndMarker() {
@@ -105,30 +109,65 @@ void processRFIDCode() {
     }
 }
 
+void checkPending() {
+  if (status == "USE") {
+    currentMillis = millis();
+
+    if (currentMillis - previousMillis >= INTERVAL) {
+      isNewCard = true;
+    } else {
+      isNewCard = false;
+    }
+
+    if (isNewCard){
+    Serial.println("Check");
+
+      if (Firebase.ready() && signupOK) {
+        Firebase.getString(fbdo, F("equipments/gymEq1/status"));
+        statusRead = fbdo.to<const char *>();
+        
+        if (statusRead != "USE") {
+          status = statusRead;
+          String jsonObject = "{\"servo\":\"CLOSE\"}";
+          Serial.println(jsonObject);
+        }
+      }
+      previousMillis = currentMillis;
+      isNewCard = false;
+    }
+  }
+}
+
 void isUserAuthorized(String rfIdCode){
-    // wait for WiFi connection
   if ((WiFi.status() == WL_CONNECTED)) {
     String encodedRFIDCode = urlencode(rfIdCode);
+    Firebase.setString(fbdo, F("equipments/gymEq1/rfidread"), encodedRFIDCode);
 
     if (Firebase.ready() && signupOK) {
       // String scannedRFID = "93 1C 7F 24"; //rfidScanned
 
-      Firebase.getString(fbdo, F("equipments/gymEq1/status"));
-      status = fbdo.to<const char *>();
       Firebase.getString(fbdo, F("equipments/gymEq1/RFID"));
       pR = fbdo.to<const char *>();
 
-      if (status == "PENDING") {
-        if (pR == encodedRFIDCode) {
-          Firebase.setString(fbdo, F("equipments/gymEq1/status"), "USE");
-          String jsonObject = "{\"is_success\":\"true\"}";
-          Serial.println(jsonObject);
-        } else {
-          String jsonObject = "{\"is_success\":\"false\",\"rfid\":\""+ encodedRFIDCode +"\",\"pR\":\""+ pR +"\",\"status\":\""+ status +"\"}";
-          Serial.println(jsonObject);
+      if (pR == encodedRFIDCode) {
+        Firebase.getString(fbdo, F("equipments/gymEq1/status"));
+        status = fbdo.to<const char *>();
+
+          if (status == "PENDING") {
+            Firebase.setString(fbdo, F("equipments/gymEq1/status"), "USE");
+            Firebase.setTimestamp(fbdo, "/equipments/gymEq1/timestamp");
+            String jsonObject = "{\"is_success\":\"USE\"}";
+            Serial.println(jsonObject);
+          } else if (status == "USE") {
+            Firebase.setString(fbdo, F("equipments/gymEq1/status"), "NEXT");
+            String jsonObject = "{\"is_success\":\"NEXT\"}";
+            Serial.println(jsonObject);
+          } else {
+            String jsonObject = "{\"is_success\":\"false\",\"error\":\"NPNT\"}";
+            Serial.println(jsonObject);
         }
       } else {
-        String jsonObject = "{\"is_success\":\"PENDING\",\"rfid\":\""+ encodedRFIDCode +"\",\"pR\":\""+ pR +"\",\"status\":\""+ status +"\"}";
+        String jsonObject = "{\"is_success\":\"false\",\"error\":\"RFID\"}";
         Serial.println(jsonObject);
       }
      
