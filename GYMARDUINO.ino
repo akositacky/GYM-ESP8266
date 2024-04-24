@@ -133,7 +133,7 @@ void loop() {
       int iCtr = 0;
       while (!mySerial.available()) {
         iCtr++;
-        if (iCtr >= 6 || mySerial.available())
+        if (iCtr >= 100 || mySerial.available())
           break;
         delay(50);
       }
@@ -171,16 +171,15 @@ unsigned extract_tag() {
     Serial.println(tag);
     mySerial.println(tag);
     Serial.println("Waiting for response from ESP-01....");
+    mySerial.listen();
 
     int iCtr = 0;
     while (!mySerial.available()) {
       iCtr++;
-      if (iCtr >= 40 || mySerial.available())
+      if (iCtr >= 200 || mySerial.available())
         break;
       delay(50);
     }
-    
-    mySerial.listen();
 
     if (mySerial.available() > 0) {
       IncomingString=mySerial.readString();
