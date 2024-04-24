@@ -31,8 +31,17 @@ char receivedChars[numChars];;
 boolean newData = false;
 Servo myServo;  // create servo object to control a servo
 
-int lockedPos = 15;
-int unlockPos = 180;
+int lockedPos = 42;
+int unlockPos = 110;
+int pos = 0;    // variable to store the servo position
+
+const char* isSuccess;
+const char* status;
+const char* timeUsage = "10";
+#define OneSecond 1000 // 1000 miliseconds
+
+static unsigned long EqTimer;
+static unsigned long LeaveTimer;
 
 void setup() {
   Serial.begin(115200); 
@@ -43,17 +52,40 @@ void setup() {
   ssrfid.listen(); 
 
   pinMode(buzzerPin, OUTPUT);
+  pinMode(ledPin, OUTPUT);
+  pinMode(ledPin2, OUTPUT);
 
   Serial.println("Waiting for RFID...");
   playAuthorized();
 
-  myServo.attach(6);  // attaches the servo on pin 6 to the servo object
+  // servo 
+  myServo.attach(9); 
+  for (pos = lockedPos; pos <= unlockPos; pos += 1) { 
+    myServo.write(pos);             
+    delay(15);                       
+  }
+  myServo.write(unlockPos);    
+  delay(1000);
+
+  for (pos = unlockPos; pos >= lockedPos; pos -= 1) { 
+    myServo.write(pos);              
+    delay(15);                     
+  }
   myServo.write(lockedPos);   
+
+  int iCtr = 0;
+  while (!mySerial.available()) {
+    iCtr++;
+    if (iCtr >= 40 || mySerial.available())
+      break;
+    delay(50);
+  }
 
   turnOnGreenLED();
 }
 
 void loop() {
+ 
   if (ssrfid.available() > 0){
     bool call_extract_tag = false;
     
@@ -83,89 +115,106 @@ void loop() {
         return;
       }
     }    
-  }    
+  }
+  if (strcmp(isSuccess, "USE") == 0) {
+    // Auto Close 
+    Serial.println((OneSecond * 60L * atoi(timeUsage) - 2500));
+    if (millis() - EqTimer >= (OneSecond * 60L * atoi(timeUsage) - 1500)) {
+      nextFunc();
+      isSuccess = "";
+    }
+
+    // Check if leave
+    if (millis() - LeaveTimer >= (OneSecond * 6L)) {
+      LeaveTimer = millis();
+      mySerial.begin(4800);
+
+      mySerial.println(" status");
+      int iCtr = 0;
+      while (!mySerial.available()) {
+        iCtr++;
+        if (iCtr >= 6 || mySerial.available())
+          break;
+        delay(50);
+      }
+
+      if (mySerial.available() > 0) {
+        String IncomingString=mySerial.readString();
+        StaticJsonDocument<200> doc1;
+        deserializeJson(doc1, IncomingString);
+        status = doc1["status"];
+        Serial.print("status ---> ");
+        Serial.println(status);
+
+        if (strcmp(isSuccess, status) != 0) {
+          nextFunc();
+          isSuccess = status;
+        }
+      }
+      ssrfid.listen(); 
+    }
+  }
 }
 
 unsigned extract_tag() {
     uint8_t msg_head = buffer[0];
-    uint8_t *msg_data = buffer + 1; // 10 byte => data contains 2byte version + 8byte tag
-    // uint8_t *msg_data_version = msg_data;
+    uint8_t *msg_data = buffer + 1;
     uint8_t *msg_data_tag = msg_data + 2;
-    // uint8_t *msg_checksum = buffer + 11; // 2 byte
-    // uint8_t msg_tail = buffer[13];
+    Serial.println("This in extract");
 
-    currentMillis = millis();
     String IncomingString="";
     long tag = hexstr_to_value(msg_data_tag, DATA_TAG_SIZE);
-    if(tag != lasttag){
-      lasttag = tag;
-      isNewCard = true;
+    playRead();
+    mySerial.begin(4800);
+
+    Serial.print("Sending data to ESP-01 :: ");
+    Serial.println(tag);
+    mySerial.println(tag);
+    Serial.println("Waiting for response from ESP-01....");
+
+    int iCtr = 0;
+    while (!mySerial.available()) {
+      iCtr++;
+      if (iCtr >= 40 || mySerial.available())
+        break;
+      delay(50);
     }
-    else{
-      if (currentMillis - previousMillis >= INTERVAL) {
-        isNewCard = true;
-      } else {
-        isNewCard = false;
-      }
-    }
+    
+    mySerial.listen();
 
-    if (isNewCard) {
-      previousMillis = currentMillis;
-      playNotAuthorized();
-      mySerial.begin(4800);
+    if (mySerial.available() > 0) {
+      IncomingString=mySerial.readString();
+      StaticJsonDocument<200> doc1;
+      deserializeJson(doc1, IncomingString);
+      isSuccess = doc1["is_success"];
+      Serial.println(isSuccess);
+      Serial.println(IncomingString);
 
-      Serial.print("Sending data to ESP-01 :: ");
-      Serial.println(tag);
-      mySerial.println(tag);
-      Serial.println("Waiting for response from ESP-01....");
-
-      int iCtr = 0;
-      while (!mySerial.available()) {
-        iCtr++;
-        if (iCtr >= 40 || mySerial.available())
-          break;
-        delay(50);
-      }
-      
-      mySerial.listen();
-  
-      if (mySerial.available() > 0) {
-
-        IncomingString=mySerial.readString();
-        StaticJsonDocument<200> doc1;
-        deserializeJson(doc1, IncomingString);
-        const char* isSuccess = doc1["is_success"];
-        Serial.println(isSuccess);
-        Serial.println(IncomingString);
-
-        if (strcmp(isSuccess, "USE") == 0) {
-          playAuthorized();
-          turnOnRedLED();
-          turnOffGreenLED();
-          myServo.write(unlockPos);   
-        } else if (strcmp(isSuccess, "NEXT") == 0) { //light up the RED LED
-          playAuthorized();
-          turnOffRedLED();
-          turnOnGreenLED();
-          myServo.write(lockedPos);   
-        } else {     // If not authorized then sound the buzzer
-          playNotAuthorized();
-        }
-
-        char rc;
-        rc = mySerial.read();
-        Serial.println(rc);
-        Serial.println(mySerial.available());
-
-        previousMillis = currentMillis + INTERVAL;
- 
+      if (strcmp(isSuccess, "USE") == 0) {
+        myServo.write(unlockPos);   
+        playAuthorized();
+        turnOnRedLED();
+        turnOffGreenLED();
+        timeUsage = doc1["timeUsage"];
+        EqTimer = millis();
+        LeaveTimer = millis();
+      } else if (strcmp(isSuccess, "NEXT") == 0) { //light up the RED LED
+        nextFunc();
+      } else {     // If not authorized then sound the buzzer
+        playUnAuth();
       }
 
-      Serial.println("Finished processing response from ESP-01....");
+      char rc;
+      rc = mySerial.read();
+      Serial.println(rc);
+      Serial.println(mySerial.available());
+
+      previousMillis = currentMillis + INTERVAL;
+
     }
 
+  Serial.println("Finished processing response from ESP-01....");
     ssrfid.listen(); 
-    isNewCard = false;
     return tag;
 }
 
@@ -179,7 +228,22 @@ long hexstr_to_value(char *str, unsigned int length) { // converts a hexadecimal
   return value;
 }
 
-void playNotAuthorized() {
+void nextFunc(){
+  myServo.write(lockedPos);   
+  playAuthorized();
+  turnOffRedLED();
+  turnOnGreenLED();
+}
+
+void playRead() {
+  tone(buzzerPin, 1500);
+  delay(100);
+  noTone(7);
+}
+
+void playUnAuth() {
+  tone(buzzerPin, 1500);
+  delay(100);
   tone(buzzerPin, 1500);
   delay(100);
   noTone(7);
